@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::util::from_wide;
 
 pub struct Foreground {
+    pub hwnd: isize,
     pub pid: u32,
     pub exe: String,
     pub fullscreen: bool,
@@ -61,7 +62,7 @@ pub fn foreground() -> Option<Foreground> {
         }
         let exe = process_exe(pid)?;
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        Some(Foreground { pid, exe, fullscreen: covers_monitor(hwnd, monitor), monitor })
+        Some(Foreground { hwnd: hwnd.0 as isize, pid, exe, fullscreen: covers_monitor(hwnd, monitor), monitor })
     }
 }
 
@@ -78,6 +79,13 @@ fn covers_monitor(hwnd: HWND, monitor: HMONITOR) -> bool {
         let m = mi.rcMonitor;
         r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
     }
+}
+
+/// True if `hwnd` still exists and is shown (games often replace a splash window with
+/// their main window, or recreate it when switching display modes).
+pub fn window_usable(hwnd: isize) -> bool {
+    let h = HWND(hwnd as *mut _);
+    unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(h)).as_bool() && IsWindowVisible(h).as_bool() }
 }
 
 pub fn primary_monitor() -> HMONITOR {

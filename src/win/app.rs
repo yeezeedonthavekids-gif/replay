@@ -22,12 +22,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotK
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::detect::{foreground, primary_monitor, ProcessWatch};
+use super::detect::{foreground, primary_monitor, window_usable, ProcessWatch};
 use super::recorder::{self, Session, SessionConfig, Shared, WM_APP_SESSION};
 use super::util::{data_dir, default_clip_dir, duration_words, human_bytes, human_secs, init_log, wide, ComGuard, MfGuard};
 use super::{clips_ui, settings_ui, sound, ui};
 use crate::core::games::{classify, sanitize_filename, Reason};
-use crate::core::settings::{buffer_bytes, Mode, Settings};
+use crate::core::settings::{buffer_bytes, CaptureMode, Mode, Settings};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SAVED: u32 = WM_APP + 2;
@@ -64,6 +64,7 @@ struct ActiveGame {
     name: String,
     reason: Reason,
     monitor: isize,
+    hwnd: isize,
     watch: ProcessWatch,
 }
 
@@ -245,6 +246,11 @@ impl App {
         if let Some(s) = self.session.take() {
             s.stop();
         }
+        // Game sessions capture only the game's window unless the user chose the whole display.
+        let window = match (&self.game, self.settings.capture) {
+            (Some(g), CaptureMode::Window) => g.hwnd,
+            _ => 0,
+        };
         let s = &self.settings;
         let cfg = SessionConfig {
             monitor,
@@ -255,6 +261,7 @@ impl App {
             audio: s.audio,
             mic: s.mic,
             game_pid: pid,
+            window,
             buffer_secs: s.buffer_secs,
             notify: self.hwnd.0 as isize,
         };
@@ -304,7 +311,18 @@ impl App {
                         self.game = None;
                         self.stop_session(Some(name));
                     } else if let Some(fg) = foreground() {
-                        if fg.pid == g.pid && fg.monitor.0 as isize != g.monitor {
+                        let window_capture = self.settings.capture == CaptureMode::Window;
+                        if fg.pid == g.pid && window_capture && fg.hwnd != g.hwnd && !window_usable(g.hwnd) {
+                            // The game replaced its window (splash -> main window, mode switch).
+                            log!("game window changed; following the new window");
+                            let (pid, mon) = (g.pid, fg.monitor.0 as isize);
+                            if let Some(g) = self.game.as_mut() {
+                                g.hwnd = fg.hwnd;
+                                g.monitor = mon;
+                            }
+                            self.start_session(mon, Some(pid));
+                        } else if fg.pid == g.pid && !window_capture && fg.monitor.0 as isize != g.monitor {
+                            // Window capture follows the window by itself; display capture must switch.
                             log!("game moved to another display; restarting capture");
                             let (pid, mon) = (g.pid, fg.monitor.0 as isize);
                             if let Some(g) = self.game.as_mut() {
@@ -320,7 +338,7 @@ impl App {
                             if let Some(watch) = ProcessWatch::new(fg.pid) {
                                 log!("game detected: {} ({}, {:?})", m.name, m.exe, m.reason);
                                 let monitor = fg.monitor.0 as isize;
-                                self.game = Some(ActiveGame { pid: fg.pid, exe: m.exe, name: m.name, reason: m.reason, monitor, watch });
+                                self.game = Some(ActiveGame { pid: fg.pid, exe: m.exe, name: m.name, reason: m.reason, monitor, hwnd: fg.hwnd, watch });
                                 self.start_session(monitor, Some(fg.pid));
                             }
                         }
@@ -565,8 +583,13 @@ impl App {
             let st = &sh.stats;
             let (w, h) = (st.width.load(Ordering::Relaxed), st.height.load(Ordering::Relaxed));
             let enc = st.encoder.lock().unwrap().clone();
+            let source = *st.source.lock().unwrap();
             if w > 0 && self.session.is_some() && sh.error.lock().unwrap().is_none() {
-                first = format!("{first} at {w}x{h}, {} fps, {} Mbps ({enc})", self.settings.fps, st.bitrate.load(Ordering::Relaxed) / 1_000_000);
+                first = format!(
+                    "{first} ({source}) at {w}x{h}, {} fps, {} Mbps ({enc})",
+                    self.settings.fps,
+                    st.bitrate.load(Ordering::Relaxed) / 1_000_000
+                );
             }
             let ring_bytes = sh.ring.lock().unwrap().bytes() as u64;
             second = format!(

@@ -13,9 +13,12 @@ when you press **Alt+F10**.
   foreground window once a second.
 - **Saving is instant.** The buffer already holds compressed video, so a save only copies
   packets into an MP4. Nothing is re-encoded, and recording never pauses.
-- **Doesn't touch your game.** Capture uses DXGI Desktop Duplication. Nothing is injected
-  into the game process, and game processes are only opened with the limited query rights
-  Task Manager uses.
+- **Records the game, not your desktop.** By default only the game's window is captured
+  (Windows.Graphics.Capture), like Medal. Other windows, notifications, Discord and your
+  second monitor never end up in clips, even if they overlap the game. Windowed games are
+  cropped to the game area, without the title bar.
+- **Doesn't touch your game.** Nothing is injected into the game process, and game
+  processes are only opened with the limited query rights Task Manager uses.
 - **No network access, no account, no telemetry.**
 
 ## Using it
@@ -51,6 +54,7 @@ If a game closes or crashes, its replay can still be saved for 2 minutes afterwa
 | Setting | Options | Default |
 |---|---|---|
 | Record | When a game is running / Always (whole screen) | When a game is running |
+| Capture | Game window only / Entire display | Game window only |
 | Replay length | 30 s, 45 s, 1, 1.5, 2, 3 min | 1 min |
 | Save hotkey | any combination with Ctrl/Alt, or a function key | Alt+F10 |
 | Resolution | Native, 1440p, 1080p, 720p (never upscales) | 1080p |
@@ -97,14 +101,18 @@ This is version 0.1. What has been verified so far:
   detection (known game and fullscreen heuristic), game-exit handling, Settings, Clips,
   Trim (output verified frame-accurate), "Don't record", and the hotkey. Error handling was
   checked where Wine lacks screen capture and encoders: clear messages, retries, no crash.
-- **Not yet verified on real Windows hardware:** screen capture, hardware/software
-  encoding, and audio capture. Wine implements none of these, so this code is compiled but
+- **Verified on real Windows by the first user:** display capture records.
+- **Not yet verified on real Windows hardware:** game-window capture (new in this
+  version), hardware/software encoding across GPUs, and audio capture. Wine implements none of these, so this code is compiled but
   untested. Please run the self-test below on your PC and report the output.
 
 Known limitations:
 
-- Captures the whole monitor the game is on, so overlays and notifications on that monitor
-  are included. The mouse cursor isn't drawn.
+- Game-window capture needs Windows 10 version 1903 or newer. On older versions Replay
+  records the game's whole display instead and says so.
+- On Windows 10, Windows draws a yellow border around the game window while it's being
+  captured. The border is not in the recording. Windows 11 lets Replay hide it.
+- The system mouse cursor isn't recorded (games draw their own cursor, which is).
 - HDR displays are captured as SDR without tone mapping, so colors can look washed out.
 - On hybrid-GPU laptops, the display must be driven by the GPU Replay runs on. Replay
   explains this if capture fails.
@@ -144,15 +152,18 @@ cargo build --release --target x86_64-pc-windows-gnu
 ## How it works
 
 ```
-                        ┌──────────── video thread (paced at the target fps) ────────────┐
-DXGI Desktop Duplication ─► D3D11 video processor ─► Media Foundation H.264 encoder ─┐
-  (GPU texture, BGRA)        (scale + BGRA→NV12)       (NVENC / AMF / QSV, or the     │
-                                                        Windows software encoder)     ▼
-                                                                                 PacketRing
-WASAPI loopback / process loopback / mic ─► 48 kHz mix ─► AAC encoder ──────────────▲
-                        └────────────────────────── audio thread ───────────────────┘
+video thread (paced at the target fps):
+  game window (Windows.Graphics.Capture) or whole display (DXGI Desktop Duplication)
+    -> D3D11 video processor (crop, scale, BGRA -> NV12)
+    -> Media Foundation H.264 encoder (NVENC / AMF / QSV, or the Windows software encoder)
+    -> PacketRing
 
-Hotkey ─► snapshot the ring (copies references, no data) ─► MP4 writer on a worker thread
+audio thread:
+  WASAPI loopback / game-only process loopback / mic
+    -> 48 kHz mix -> AAC encoder -> PacketRing
+
+hotkey:
+  snapshot the ring (copies references, not data) -> MP4 writer on a worker thread
 ```
 
 - **Frames stay on the GPU** from capture to encoder. The encoder reads D3D11 textures
@@ -180,7 +191,7 @@ src/core/      platform-independent, unit-tested
   games.rs       game detection rules and known-game list
   resample.rs    audio resampler
 src/win/       Windows
-  capture.rs     Desktop Duplication + GPU colour conversion
+  capture.rs     game-window capture (WGC), Desktop Duplication, GPU colour conversion
   encoder.rs     Media Foundation H.264 (hardware async MFTs, software fallback)
   audio.rs       WASAPI capture, mixing, AAC
   recorder.rs    recording session (threads, pacing, recovery)

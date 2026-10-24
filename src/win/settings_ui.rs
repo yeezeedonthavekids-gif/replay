@@ -36,6 +36,7 @@ const ID_ADDGAME: i32 = 26;
 const ID_REMOVE: i32 = 27;
 const ID_STATUS1: i32 = 28;
 const ID_STATUS2: i32 = 29;
+const ID_CAPTURE: i32 = 30;
 const ID_SAVE: i32 = 1; // IDOK
 const ID_CANCEL: i32 = 2; // IDCANCEL
 
@@ -54,6 +55,7 @@ const ID_L_FPS: i32 = 54;
 const ID_L_QUALITY: i32 = 55;
 const ID_L_ENCODER: i32 = 56;
 const ID_L_AUDIO: i32 = 57;
+const ID_L_CAPTURE: i32 = 58;
 
 const LENGTH_LABELS: [&str; 6] = ["30 seconds", "45 seconds", "1 minute", "1.5 minutes", "2 minutes", "3 minutes"];
 const RES_LABELS: [&str; 4] = ["Native", "1440p", "1080p", "720p"];
@@ -115,6 +117,7 @@ fn nearest(choices: &[u32], v: u32) -> usize {
 fn populate(h: HWND) {
     let Some((s, autostart)) = WIN.with(|w| w.borrow().as_ref().map(|w| (w.draft.clone(), w.autostart))) else { return };
     ui::combo_fill(ui::item(h, ID_MODE), &["When a game is running", "Always (whole screen)"], (s.mode == Mode::Always) as usize);
+    ui::combo_fill(ui::item(h, ID_CAPTURE), &["Game window only", "Entire display"], (s.capture == CaptureMode::Display) as usize);
     ui::combo_fill(ui::item(h, ID_LENGTH), &LENGTH_LABELS, nearest(&BUFFER_CHOICES, s.buffer_secs));
     ui::send(ui::item(h, ID_HOTKEY), HKM_SETHOTKEY, ui::hotkey_to_control(s.hotkey), 0);
     ui::combo_fill(ui::item(h, ID_RES), &RES_LABELS, HEIGHT_CHOICES.iter().position(|&x| x == s.height).unwrap_or(2));
@@ -152,6 +155,7 @@ fn fill_games(h: HWND, s: &Settings) {
 fn collect(h: HWND) -> Option<Settings> {
     let (mut s, original) = WIN.with(|w| w.borrow().as_ref().map(|w| (w.draft.clone(), w.original_hotkey)))?;
     s.mode = if ui::combo_sel(ui::item(h, ID_MODE)) == 1 { Mode::Always } else { Mode::Games };
+    s.capture = if ui::combo_sel(ui::item(h, ID_CAPTURE)) == 1 { CaptureMode::Display } else { CaptureMode::Window };
     s.buffer_secs = BUFFER_CHOICES[ui::combo_sel(ui::item(h, ID_LENGTH)).min(BUFFER_CHOICES.len() - 1)];
     let hk = ui::send(ui::item(h, ID_HOTKEY), HKM_GETHOTKEY, 0, 0) as usize;
     // The hotkey control can't show the Windows key; keep the original if unchanged.
@@ -175,7 +179,7 @@ fn update_estimate(h: HWND) {
     ui::set_text(
         ui::item(h, ID_ESTIMATE),
         &format!(
-            "{w}x{hh} on your main display at about {} Mbps. The replay buffer uses about {} of memory; a full clip is the same size on disk.",
+            "A fullscreen game on your main display records at {w}x{hh}, about {} Mbps. The replay buffer uses about {} of memory; a full clip is the same size on disk.",
             (bps + 500_000) / 1_000_000,
             human_bytes(bytes)
         ),
@@ -217,15 +221,16 @@ fn layout(h: HWND) {
 
     ui::place(ui::item(h, ID_H_RECORDING), lx, s(16), colw, s(24));
     row(ID_L_MODE, ID_MODE, lx, s(48), ctrl_w, labelw);
-    row(ID_L_LENGTH, ID_LENGTH, lx, s(80), ctrl_w, labelw);
-    row(ID_L_HOTKEY, ID_HOTKEY, lx, s(112), ctrl_w, labelw);
+    row(ID_L_CAPTURE, ID_CAPTURE, lx, s(80), ctrl_w, labelw);
+    row(ID_L_LENGTH, ID_LENGTH, lx, s(112), ctrl_w, labelw);
+    row(ID_L_HOTKEY, ID_HOTKEY, lx, s(144), ctrl_w, labelw);
 
-    ui::place(ui::item(h, ID_H_VIDEO), lx, s(152), colw, s(24));
-    row(ID_L_RES, ID_RES, lx, s(184), ctrl_w, labelw);
-    row(ID_L_FPS, ID_FPS, lx, s(216), ctrl_w, labelw);
-    row(ID_L_QUALITY, ID_QUALITY, lx, s(248), ctrl_w, labelw);
-    row(ID_L_ENCODER, ID_ENCODER, lx, s(280), ctrl_w, labelw);
-    ui::place(ui::item(h, ID_ESTIMATE), lx, s(314), colw, s(64));
+    ui::place(ui::item(h, ID_H_VIDEO), lx, s(184), colw, s(24));
+    row(ID_L_RES, ID_RES, lx, s(216), ctrl_w, labelw);
+    row(ID_L_FPS, ID_FPS, lx, s(248), ctrl_w, labelw);
+    row(ID_L_QUALITY, ID_QUALITY, lx, s(280), ctrl_w, labelw);
+    row(ID_L_ENCODER, ID_ENCODER, lx, s(312), ctrl_w, labelw);
+    ui::place(ui::item(h, ID_ESTIMATE), lx, s(346), colw, s(64));
     let _ = ctrl_x;
 
     ui::place(ui::item(h, ID_H_AUDIO), rx, s(16), colw, s(24));
@@ -271,6 +276,7 @@ fn create_controls(h: HWND) {
     label(ID_H_GAMES, "Games");
     label(ID_H_STATUS, "Status");
     label(ID_L_MODE, "Record");
+    label(ID_L_CAPTURE, "Capture");
     label(ID_L_LENGTH, "Replay length");
     label(ID_L_HOTKEY, "Save hotkey");
     label(ID_L_RES, "Resolution");
@@ -282,6 +288,7 @@ fn create_controls(h: HWND) {
         ui::control(h, w!("COMBOBOX"), "", tab | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0, none, id);
     };
     combo(ID_MODE);
+    combo(ID_CAPTURE);
     combo(ID_LENGTH);
     ui::control(h, w!("msctls_hotkey32"), "", tab, none, ID_HOTKEY);
     combo(ID_RES);

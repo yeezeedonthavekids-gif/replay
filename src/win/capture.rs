@@ -1,13 +1,28 @@
-//! Screen capture with DXGI Desktop Duplication, plus GPU colour conversion and scaling
-//! (BGRA -> NV12) with the D3D11 video processor. Frames never leave the GPU.
+//! Video capture plus GPU colour conversion and scaling (BGRA -> NV12) with the D3D11 video
+//! processor. Frames never leave the GPU. Two sources:
 //!
-//! Desktop Duplication works with fullscreen, borderless and windowed games, does not
-//! inject anything into the game process, and has no capture border.
+//! - **Window** (default for games): Windows.Graphics.Capture of the game window only. It
+//!   captures the window's own content through the compositor, so other windows,
+//!   notifications and other monitors never appear in clips, even if they overlap the game.
+//! - **Display**: DXGI Desktop Duplication of a whole monitor (the "Always record" mode, and
+//!   the fallback if window capture is unavailable).
+//!
+//! Neither injects anything into the game process.
 
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, Result};
+use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindow};
 use windows::Win32::Foundation::{HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -87,8 +102,35 @@ struct Converter {
     outputs: Vec<ID3D11VideoProcessorOutputView>,
 }
 
-pub struct DesktopCapture {
+/// Windows.Graphics.Capture state for one window.
+struct WindowSource {
+    hwnd: HWND,
+    _item: GraphicsCaptureItem,
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    device: IDirect3DDevice,
+    pool_size: SizeInt32,
+    /// Client area inside the captured frame (x, y, w, h), so title bars and borders of
+    /// windowed games are cropped away.
+    crop: Option<(u32, u32, u32, u32)>,
+    crop_checked: Option<Instant>,
+}
+
+impl Drop for WindowSource {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
+enum Source {
+    Display,
+    Window(WindowSource),
+}
+
+pub struct Capture {
     pub gpu: Gpu,
+    source: Source,
     output: IDXGIOutput1,
     dup: Option<IDXGIOutputDuplication>,
     rotation: DXGI_MODE_ROTATION,
@@ -108,10 +150,31 @@ pub struct DesktopCapture {
 /// texture is only reused after the encoder has had several frame times to consume it.
 const POOL: usize = 8;
 
-impl DesktopCapture {
-    pub fn new(gpu: Gpu, output: IDXGIOutput1) -> Result<DesktopCapture> {
-        let mut cap = DesktopCapture {
+/// Client area of `hwnd` relative to the window's visible frame, which is what
+/// Windows.Graphics.Capture delivers for a window.
+fn client_crop(hwnd: HWND) -> Option<(u32, u32, u32, u32)> {
+    unsafe {
+        let mut frame = RECT::default();
+        DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut frame as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).ok()?;
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client).ok()?;
+        let mut origin = POINT::default();
+        if !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return None;
+        }
+        let x = (origin.x - frame.left).max(0) as u32;
+        let y = (origin.y - frame.top).max(0) as u32;
+        let (w, h) = (client.right.max(0) as u32, client.bottom.max(0) as u32);
+        (w >= 16 && h >= 16).then_some((x, y, w, h))
+    }
+}
+
+impl Capture {
+    /// Captures a whole monitor with Desktop Duplication.
+    pub fn new_display(gpu: Gpu, output: IDXGIOutput1) -> Result<Capture> {
+        let mut cap = Capture {
             gpu,
+            source: Source::Display,
             output,
             dup: None,
             rotation: DXGI_MODE_ROTATION_IDENTITY,
@@ -129,8 +192,74 @@ impl DesktopCapture {
         Ok(cap)
     }
 
-    /// Logical desktop size of the output (after rotation).
-    pub fn desktop_size(&self) -> Result<(u32, u32)> {
+    /// Captures only `hwnd` with Windows.Graphics.Capture (Windows 10 1903+).
+    pub fn new_window(gpu: Gpu, output: IDXGIOutput1, hwnd: HWND) -> Result<Capture> {
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+            }
+            if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+                return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_NOTIMPL));
+            }
+            let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+            let item: GraphicsCaptureItem = interop.CreateForWindow(hwnd)?;
+            let dxgi: IDXGIDevice = gpu.device.cast()?;
+            let device: IDirect3DDevice = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()?;
+            let size = item.Size()?;
+            let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
+            let session = pool.CreateCaptureSession(&item)?;
+            // Games draw their own cursor; the system cursor would only show in menus.
+            let _ = session.SetIsCursorCaptureEnabled(false);
+            // Windows 11 can hide the yellow "being captured" border (asks for access first;
+            // unpackaged apps are granted it). Windows 10 always shows the border on screen,
+            // but it is never part of the recording.
+            if let Ok(op) = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless) {
+                let _ = op.join();
+            }
+            let _ = session.SetIsBorderRequired(false);
+            session.StartCapture()?;
+            let source = WindowSource {
+                hwnd,
+                _item: item,
+                pool,
+                session,
+                device,
+                pool_size: size,
+                crop: client_crop(hwnd),
+                crop_checked: Some(Instant::now()),
+            };
+            Ok(Capture {
+                gpu,
+                source: Source::Window(source),
+                output,
+                dup: None,
+                rotation: DXGI_MODE_ROTATION_IDENTITY,
+                frame: None,
+                has_image: false,
+                last_dup_attempt: None,
+                conv: None,
+                pool: Vec::new(),
+                next: 0,
+                out_w: 0,
+                out_h: 0,
+                fps: 60,
+            })
+        }
+    }
+
+    pub fn is_window(&self) -> bool {
+        matches!(self.source, Source::Window(_))
+    }
+
+    /// Size of what is being captured: the game's client area, or the monitor.
+    pub fn source_size(&self) -> Result<(u32, u32)> {
+        if let Source::Window(w) = &self.source {
+            if let Some((_, _, cw, ch)) = w.crop.or_else(|| client_crop(w.hwnd)) {
+                return Ok((cw, ch));
+            }
+            let s = w.pool_size;
+            return Ok((s.Width.max(2) as u32, s.Height.max(2) as u32));
+        }
         let d = unsafe { self.output.GetDesc()? };
         let r = d.DesktopCoordinates;
         Ok(((r.right - r.left).max(2) as u32, (r.bottom - r.top).max(2) as u32))
@@ -159,6 +288,9 @@ impl DesktopCapture {
     /// Fetches the newest desktop image if it changed. Returns Err only for device-level
     /// failures that require recreating the whole pipeline.
     pub fn grab(&mut self) -> Result<()> {
+        if matches!(self.source, Source::Window(_)) {
+            return self.grab_window();
+        }
         if self.dup.is_none() {
             // Duplication is lost during UAC prompts, the lock screen, mode changes and
             // exclusive fullscreen transitions; retry a few times per second.
@@ -180,7 +312,7 @@ impl DesktopCapture {
                 Ok(()) => {
                     let result = if info.LastPresentTime != 0 || !self.has_image {
                         match resource.as_ref().map(|r| r.cast::<ID3D11Texture2D>()) {
-                            Some(Ok(tex)) => self.copy_frame(&tex),
+                            Some(Ok(tex)) => self.copy_frame(&tex, None),
                             _ => Ok(()),
                         }
                     } else {
@@ -200,9 +332,50 @@ impl DesktopCapture {
         }
     }
 
-    unsafe fn copy_frame(&mut self, src: &ID3D11Texture2D) -> Result<()> {
+    /// Takes the newest window frame, if any (the window may be minimized or unchanged).
+    fn grab_window(&mut self) -> Result<()> {
+        let Source::Window(w) = &mut self.source else { return Ok(()) };
+        let mut latest = None;
+        while let Ok(f) = w.pool.TryGetNextFrame() {
+            if let Some(old) = latest.replace(f) {
+                let _ = old.Close();
+            }
+        }
+        let Some(frame) = latest else { return Ok(()) };
+        let content = frame.ContentSize()?;
+        if content.Width != w.pool_size.Width || content.Height != w.pool_size.Height {
+            // The window was resized: resize the frame pool; the crop is re-measured below.
+            w.pool.Recreate(&w.device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, content)?;
+            w.pool_size = content;
+            w.crop_checked = None;
+        }
+        if w.crop_checked.map(|t| t.elapsed() > Duration::from_millis(500)).unwrap_or(true) {
+            w.crop = client_crop(w.hwnd);
+            w.crop_checked = Some(Instant::now());
+        }
+        let (cw, ch) = (content.Width.max(1) as u32, content.Height.max(1) as u32);
+        let region = match w.crop {
+            Some((x, y, rw, rh)) if x < cw && y < ch => (x, y, rw.min(cw - x), rh.min(ch - y)),
+            _ => (0, 0, cw, ch),
+        };
+        let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
+        let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
+        let result = unsafe { self.copy_frame(&tex, Some(region)) };
+        let _ = frame.Close();
+        result
+    }
+
+    /// Copies the captured image (or `region` of it: x, y, w, h) into our own texture.
+    unsafe fn copy_frame(&mut self, src: &ID3D11Texture2D, region: Option<(u32, u32, u32, u32)>) -> Result<()> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         src.GetDesc(&mut desc);
+        if let Some((x, y, w, h)) = region {
+            let w = w.min(desc.Width.saturating_sub(x)).max(2) & !1;
+            let h = h.min(desc.Height.saturating_sub(y)).max(2) & !1;
+            desc.Width = w;
+            desc.Height = h;
+            let _ = (x, y);
+        }
         let matches = matches!(&self.frame, Some((_, w, h, f)) if *w == desc.Width && *h == desc.Height && *f == desc.Format);
         if !matches {
             let own = D3D11_TEXTURE2D_DESC {
@@ -223,7 +396,13 @@ impl DesktopCapture {
             self.conv = None; // input size changed: rebuild the converter
         }
         let (own, ..) = self.frame.as_ref().unwrap();
-        self.gpu.context.CopyResource(own, src);
+        match region {
+            Some((x, y, _, _)) => {
+                let b = D3D11_BOX { left: x, top: y, front: 0, right: x + desc.Width, bottom: y + desc.Height, back: 1 };
+                self.gpu.context.CopySubresourceRegion(own, 0, 0, 0, 0, src, 0, Some(&b));
+            }
+            None => self.gpu.context.CopyResource(own, src),
+        }
         self.has_image = true;
         Ok(())
     }

@@ -18,7 +18,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use super::audio::{self, SourceKind};
-use super::capture::{open_gpu_for_monitor, DesktopCapture};
+use super::capture::{open_gpu_for_monitor, Capture};
 use super::encoder::{EncodedFrame, H264Encoder};
 use super::util::{err_text, now_hns, ComGuard};
 use crate::core::clip::{self, ClipInfo, VideoParams};
@@ -39,6 +39,8 @@ pub struct SessionConfig {
     pub audio: AudioMode,
     pub mic: bool,
     pub game_pid: Option<u32>,
+    /// Game window to capture on its own; 0 = capture the whole monitor.
+    pub window: isize,
     pub buffer_secs: u32,
     pub notify: isize,
 }
@@ -52,6 +54,8 @@ pub struct Stats {
     pub height: AtomicU32,
     pub bitrate: AtomicU32,
     pub encoder: Mutex<String>,
+    /// "game window" or "whole display".
+    pub source: Mutex<&'static str>,
 }
 
 pub struct Shared {
@@ -311,23 +315,42 @@ fn run_video(shared: &Shared, cfg: &SessionConfig, failures: &mut u32) -> Result
     let (gpu, output) = open_gpu_for_monitor(monitor).map_err(|e| format!("Could not open the GPU: {}", err_text(&e)))?;
     let adapter = gpu.adapter_name.clone();
     log!("video: starting screen capture on {adapter}");
-    let mut cap = DesktopCapture::new(gpu, output).map_err(|e| {
+    let display_error = |e: windows::core::Error| {
         if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_UNSUPPORTED {
             format!("This display can't be captured on {adapter} (hybrid-GPU laptops: set Replay to the GPU that drives this display in Windows Graphics settings)")
         } else {
             format!("Screen capture unavailable: {}", err_text(&e))
         }
-    })?;
-    let (src_w, src_h) = cap.desktop_size().map_err(|e| err_text(&e))?;
+    };
+    let mut cap = if cfg.window != 0 {
+        let hwnd = windows::Win32::Foundation::HWND(cfg.window as *mut _);
+        match Capture::new_window(gpu, output.clone(), hwnd) {
+            Ok(c) => {
+                log!("video: capturing the game window only");
+                c
+            }
+            Err(e) => {
+                // Older Windows (before 1903) or a window that refuses capture.
+                log!("video: window capture unavailable ({}); capturing the whole display", err_text(&e));
+                shared.set_note("Game-window capture isn't available here, so the whole display is recorded");
+                let (gpu, output) = open_gpu_for_monitor(monitor).map_err(|e| format!("Could not open the GPU: {}", err_text(&e)))?;
+                Capture::new_display(gpu, output).map_err(display_error)?
+            }
+        }
+    } else {
+        Capture::new_display(gpu, output).map_err(display_error)?
+    };
+    let (src_w, src_h) = cap.source_size().map_err(|e| err_text(&e))?;
     let (w, h) = output_size(src_w, src_h, cfg.height);
     let fps = cfg.fps.max(1);
     let bitrate = video_bitrate(w, h, fps, cfg.quality);
-    log!("video: desktop {src_w}x{src_h}, encoding {w}x{h}@{fps}");
+    log!("video: source {src_w}x{src_h}, encoding {w}x{h}@{fps}");
     let mut enc = H264Encoder::new(&cap.gpu, w, h, fps, bitrate, cfg.encoder == EncoderPref::Auto)?;
     cap.set_output(w, h, fps).map_err(|e| format!("Could not allocate video frames: {}", err_text(&e)))?;
 
     *shared.stats.encoder.lock().unwrap() =
         format!("{}{}", enc.name, if enc.hardware { "" } else { " (software)" });
+    *shared.stats.source.lock().unwrap() = if cap.is_window() { "game window only" } else { "whole display" };
     shared.stats.width.store(w, Ordering::Relaxed);
     shared.stats.height.store(h, Ordering::Relaxed);
     shared.stats.bitrate.store(bitrate, Ordering::Relaxed);

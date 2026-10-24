@@ -8,6 +8,15 @@ pub enum Mode {
     Always,
 }
 
+/// What a game session records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// Only the game window (nothing else on screen ends up in clips).
+    Window,
+    /// The whole monitor the game is on.
+    Display,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioMode {
     /// Everything playing on the default output device.
@@ -51,6 +60,7 @@ pub const FPS_CHOICES: [u32; 3] = [30, 60, 120];
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub mode: Mode,
+    pub capture: CaptureMode,
     pub buffer_secs: u32,
     /// Output height; 0 = native resolution.
     pub height: u32,
@@ -73,6 +83,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             mode: Mode::Games,
+            capture: CaptureMode::Window,
             buffer_secs: 60,
             height: 1080,
             fps: 60,
@@ -112,6 +123,7 @@ impl Settings {
             let num = v.parse::<u32>().ok();
             match k {
                 "mode" => s.mode = if v == "always" { Mode::Always } else { Mode::Games },
+                "capture" => s.capture = if v == "display" { CaptureMode::Display } else { CaptureMode::Window },
                 "buffer_seconds" => {
                     if let Some(n) = num.filter(|n| (10..=600).contains(n)) {
                         s.buffer_secs = n;
@@ -168,11 +180,15 @@ impl Settings {
     pub fn serialize(&self) -> String {
         format!(
             "# Replay settings\n\
-             mode={}\nbuffer_seconds={}\nheight={}\nfps={}\nquality={}\nencoder={}\naudio={}\n\
+             mode={}\ncapture={}\nbuffer_seconds={}\nheight={}\nfps={}\nquality={}\nencoder={}\naudio={}\n\
              microphone={}\nhotkey=0x{:02X},{}\nfolder={}\nsound={}\ngames={}\nignored={}\n",
             match self.mode {
                 Mode::Games => "games",
                 Mode::Always => "always",
+            },
+            match self.capture {
+                CaptureMode::Window => "window",
+                CaptureMode::Display => "display",
             },
             self.buffer_secs,
             self.height,
@@ -205,6 +221,7 @@ impl Settings {
     /// True if a change requires restarting the capture pipeline.
     pub fn pipeline_differs(&self, other: &Settings) -> bool {
         self.height != other.height
+            || self.capture != other.capture
             || self.fps != other.fps
             || self.quality != other.quality
             || self.encoder != other.encoder
@@ -255,6 +272,7 @@ mod tests {
     fn round_trips() {
         let mut s = Settings::default();
         s.mode = Mode::Always;
+        s.capture = CaptureMode::Display;
         s.audio = AudioMode::Game;
         s.mic = true;
         s.hotkey = Hotkey { vk: 0x77, mods: MOD_CONTROL | MOD_SHIFT };

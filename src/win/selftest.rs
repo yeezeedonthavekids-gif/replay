@@ -35,6 +35,7 @@ pub fn run(args: &[String]) -> i32 {
         audio: AudioMode::System,
         mic: false,
         game_pid: None,
+        window: 0,
         buffer_secs: 60,
         notify: 0,
     };
