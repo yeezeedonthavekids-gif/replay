@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg (used by the MP4 round-trip tests)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: cargo test
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release
+      - run: cargo test --release
+      - name: Pipeline self-test
+        # Hosted runners have no GPU and may lack Media Foundation, so this is informative
+        # rather than a gate. It still exercises capture/encoder initialization on real Windows.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath target\release\replay.exe -ArgumentList '--selftest','5','selftest.mp4','--software' -Wait -PassThru
+          Get-Content "$env:LOCALAPPDATA\Replay\replay.log"
+          if (Test-Path selftest.mp4) { Get-Item selftest.mp4 | Format-List Name,Length }
+          exit $p.ExitCode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-exe
+          path: target/release/replay.exe
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/replay.exe
