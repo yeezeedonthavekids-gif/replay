@@ -1,0 +1,17 @@
+# Replay's website: a static page in site/. The build only packs Replay's source code
+# (everything but the website itself) into a zip the page links to. The app itself,
+# site/Replay-0.1.exe, is committed next to the page.
+[build]
+  base = "site"
+  publish = "."
+  command = "git -C .. archive --format=zip --prefix=Replay-0.1/ -o \"$PWD/Replay-0.1-source.zip\" HEAD -- . ':!site' ':!.github' ':!netlify.toml'"
+
+[[headers]]
+  for = "/img/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/Replay-0.1.exe"
+  [headers.values]
+    Content-Disposition = "attachment; filename=Replay-0.1.exe"
